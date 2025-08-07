@@ -44,10 +44,11 @@ class MCTSNode(object):
         self.creation_index = MCTSNode._creation_counter  # Track creation order
         MCTSNode._creation_counter += 1
         self.timestamp = datetime.now().isoformat()
+        self._successful = None
 
     @property
     def successful(self):
-        if not hasattr(self, '_successful'):
+        if self._successful is None:
             # Find the last experiment_reviewer message
             self._successful = False
             if self.messages:
@@ -120,6 +121,7 @@ Deliverables:
         return {
             "id": self.id,
             "parent_id": self.parent_id,
+            "successful": self.successful,
             "level": self.level,
             "node_idx": self.node_idx,
             "parent_idx": self.parent_idx,

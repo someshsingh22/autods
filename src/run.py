@@ -118,57 +118,57 @@ def run_mcts(
                 experiment_generator_agent=experiment_generator_agent)
 
             if new_query is not None:
-                try:
-                    new_level = node.level + 1
-                    new_node_idx = len(nodes_by_level[new_level])
-                    allow_generate = allow_generate_experiments if new_level > 0 else False
-                    child = MCTSNode(level=new_level, node_idx=new_node_idx, hypothesis=new_hypothesis, query=new_query,
-                                     parent=node, allow_generate_experiments=allow_generate)
-                    node.children.append(child)
-                    nodes_by_level[new_level].append(child)
-                    node = child
+                new_level = node.level + 1
+                new_node_idx = len(nodes_by_level[new_level])
+                allow_generate = allow_generate_experiments if new_level > 0 else False
+                child = MCTSNode(level=new_level, node_idx=new_node_idx, hypothesis=new_hypothesis, query=new_query,
+                                 parent=node, allow_generate_experiments=allow_generate)
+                node.children.append(child)
+                nodes_by_level[new_level].append(child)
+                node = child
 
-                    # Update logger state
-                    logger.level = node.level
-                    logger.node_idx = node.node_idx
+                # Update logger state
+                logger.level = node.level
+                logger.node_idx = node.node_idx
 
-                    # Load previous explorations (make sure the root is always included)
-                    node_context = []
-                    if node.level > 1:
-                        node_context = [root.children[0].get_context(include_code_output=True)] + node.get_path_context(
-                            k=k_parents - 1, skip_root=True)
-                    node_messages = []
-                    if node_context is not None:
-                        node_messages += [
-                            {"name": "user_proxy", "role": "user", "content": "PREVIOUS EXPLORATION:\n\n" + n} for n in
-                            node_context]
+                # Load previous explorations (make sure the root is always included)
+                node_context = []
+                if node.level > 1:
+                    node_context = [root.children[0].get_context(include_code_output=True)] + node.get_path_context(
+                        k=k_parents - 1, skip_root=True)
+                node_messages = []
+                if node_context is not None:
                     node_messages += [
-                        {"name": "user_proxy", "role": "user", "content": node.query}]
-                    _, last_message = chat_manager.resume(messages=node_messages)
+                        {"name": "user_proxy", "role": "user", "content": "PREVIOUS EXPLORATION:\n\n" + n} for n in
+                        node_context]
+                node_messages += [
+                    {"name": "user_proxy", "role": "user", "content": node.query}]
+                _, last_message = chat_manager.resume(messages=node_messages)
 
-                    # Generate new experiments
-                    user_proxy.initiate_chat(recipient=chat_manager, message=last_message, clear_history=False)
-                    logger.log_node(node.level, node.node_idx, chat_manager.messages_to_string(groupchat.messages))
-                    node.messages = get_msgs_from_latest_query(groupchat.messages)
+                # Generate new experiments
+                user_proxy.initiate_chat(recipient=chat_manager, message=last_message, clear_history=False)
+                logger.log_node(node.level, node.node_idx, chat_manager.messages_to_string(groupchat.messages))
+                node.messages = get_msgs_from_latest_query(groupchat.messages)
 
-                    # Store generated experiments
-                    assert node.messages[-1]['name'] == "experiment_generator"
-                    experiments = try_loading_dict(node.messages[-1]['content']).get('experiments', [])
-                    node.untried_experiments += experiments
+                # Store generated experiments
+                assert node.messages[-1]['name'] == "experiment_generator"
+                experiments = try_loading_dict(node.messages[-1]['content']).get('experiments', [])
+                node.untried_experiments += experiments
 
-                    # Calculate beliefs and rewards
-                    if node.successful and node.level > 1:
-                        # Belief elicitation
-                        is_surprisal, belief_change, prior, posterior = calculate_prior_and_posterior_beliefs(
-                            node,
-                            model=belief_model_name,
-                            temperature=belief_temperature,
-                            reasoning_effort=reasoning_effort,
-                            n_samples=n_belief_samples,
-                            implicit_bayes_posterior=implicit_bayes_posterior,
-                            surprisal_width=surprisal_width,
-                            belief_mode=belief_mode
-                        )
+                # Calculate beliefs and rewards
+                if node.successful and node.level > 1:
+                    # Belief elicitation
+                    is_surprisal, belief_change, prior, posterior = calculate_prior_and_posterior_beliefs(
+                        node,
+                        model=belief_model_name,
+                        temperature=belief_temperature,
+                        reasoning_effort=reasoning_effort,
+                        n_samples=n_belief_samples,
+                        implicit_bayes_posterior=implicit_bayes_posterior,
+                        surprisal_width=surprisal_width,
+                        belief_mode=belief_mode
+                    )
+                    if is_surprisal is not None:
                         node.surprising = is_surprisal
                         node.prior = prior
                         node.posterior = posterior
@@ -180,11 +180,10 @@ def run_mcts(
 
                         # Print debug information
                         print_node_info(node)
-
-                except OpenAIBadRequestError:
-                    print(f"BadRequestError on iteration {iteration_idx} for node {node.level}_{node.node_idx}. "
-                          "Skipping this node and continuing.")
-                    continue
+                    else:
+                        print(f"Skipping node {node.level}_{node.node_idx} due to belief calculation failure.")
+                        node._successful = False
+                        continue
 
             # MCTS BACKPROPAGATION
             node.update_counts(visits=1, reward=node.self_value)
