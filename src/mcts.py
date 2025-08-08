@@ -6,113 +6,150 @@ from datetime import datetime
 
 import numpy as np
 
+from src.mcts_utils import get_query_from_experiment, get_experiment_from_query, get_node_level_idx, get_context_string
 from src.utils import try_loading_dict
 
 
 class MCTSNode(object):
     _creation_counter = 0
 
-    def __init__(self, level, node_idx, hypothesis, query, parent_idx=None, parent=None, untried_experiments=None,
-                 allow_generate_experiments=False):
+    def __init__(self, level=None, node_idx=None, hypothesis=None, query=None, parent_idx=None, parent=None,
+                 untried_experiments=None, allow_generate_experiments=False, experiment_plan=None, code=None,
+                 code_output=None, analysis=None, review=None, creation_idx=None):
+        # Tree attributes
+        self.creation_idx = creation_idx if creation_idx is not None else MCTSNode._creation_counter
+        MCTSNode._creation_counter += 1  # Used to replay MCTS from log files
+        self.time_elapsed = None
         self.level = level
         self.node_idx = node_idx
-        self.id = f"node_{self.level}_{self.node_idx}"
-        self.parent: Optional[MCTSNode] = parent
+        self.id = f"node_{self.level}_{self.node_idx}" if self.level is not None and self.node_idx is not None else None
+        self.children = []
+        self.parent = parent  # MCTSNode
         if self.parent is not None:
             self.parent_idx = self.parent.node_idx
             self.parent_id = self.parent.id
+            self.parent.children.append(self)
         else:
             self.parent_idx = parent_idx
             self.parent_id = f"node_{self.level - 1}_{self.parent_idx}" if self.parent_idx is not None else None
-        self.hypothesis = hypothesis
+        self.success = None
+
+        # Agent attributes
         self.query = query
-        self.children = []
-        self.visits = 0  # Visits to this node or its children
-        self.value = 0.  # Number of surprising hypotheses
-        self.self_value = 0.  # Value of this node only (not aggregated from children)
+        self.messages = []
         self.untried_experiments = untried_experiments.copy() if untried_experiments is not None else []
         self.tried_experiments = []  # Track all tried experiments
         self.allow_generate_experiments = allow_generate_experiments
-        self.messages = []  # Store messages for this node
 
-        # Belief
+        # Experiment attributes
+        self.hypothesis = hypothesis
+        self.experiment_plan = experiment_plan
+        self.code = code
+        self.code_output = code_output
+        self.analysis = analysis
+        self.review = review
+
+        # MCTS attributes
+        self.visits = 0  # Visits to this node or its children
+        self.value = 0.  # Number of surprising hypotheses
+        self.self_value = 0.  # Value of this node only (not aggregated from children)
+
+        # Belief attributes
         self.surprising: Optional[bool] = None
         self.prior = None
         self.posterior = None
         self.belief_change: Optional[float] = None  # Change in belief from prior to posterior
 
-        self.creation_index = MCTSNode._creation_counter  # Track creation order
-        MCTSNode._creation_counter += 1
-        self.timestamp = datetime.now().isoformat()
-        self._successful = None
+    def init_from_dict(self, data):
+        """Initialize node attributes from a dictionary."""
+        # Tree attributes
+        self.creation_idx = data.get('creation_idx', MCTSNode._creation_counter)
+        self.time_elapsed = data.get('time_elapsed', self.time_elapsed)
+        self.id = data.get('id', None)
+        if self.id is not None:
+            self.level, self.node_idx = get_node_level_idx(self.id)
+        else:
+            self.level = data['level']
+            self.node_idx = data['node_idx']
+            self.id = f"node_{self.level}_{self.node_idx}"
+        self.parent_id = data.get('parent_id', self.parent_id)
+        if self.parent_id is not None:
+            _, self.parent_idx = get_node_level_idx(self.parent_id)
+        else:
+            self.parent_idx = data.get('parent_idx', self.parent_idx)
+            if self.parent_idx is not None:
+                self.parent_id = f"node_{self.level - 1}_{self.parent_idx}"
+        self.success = data.get('success', self.success)
 
-    @property
-    def successful(self):
-        if self._successful is None:
-            # Find the last experiment_reviewer message
-            self._successful = False
-            if self.messages:
-                for msg in reversed(self.messages):
-                    if msg.get("name") == "experiment_reviewer":
-                        try:
-                            last_review = json.loads(msg["content"])
-                            self._successful = last_review.get("success", False)
-                        except (json.JSONDecodeError, TypeError):
-                            self._successful = False
-                        break
-        return self._successful
+        # Agent attributes
+        self.query = data.get('query', "N/A")
+        self.messages = data.get('messages', self.messages)
+        self.untried_experiments = data.get('untried_experiments', self.untried_experiments)
+        # self.tried_experiments = data.get('tried_experiments', self.tried_experiments)
+        self.allow_generate_experiments = self.allow_generate_experiments and self.level > 0
 
-    def get_next_experiment(self, experiment_generator_agent=None):
+        # Experiment attributes
+        self.hypothesis = data.get('hypothesis', self.hypothesis)
+        self.experiment_plan = data.get('experiment_plan', self.experiment_plan)
+        self.code = data.get('code', self.code)
+        self.code_output = data.get('code_output', self.code_output)
+        self.analysis = data.get('analysis', self.analysis)
+        self.review = data.get('review', self.review)
+
+        # MCTS attributes
+        self.visits = data.get('visits', self.visits)
+        self.value = data.get('value', self.value)
+        self.self_value = data.get('self_value', self.self_value)
+
+        # Belief attributes
+        self.surprising = data.get('surprising', self.surprising)
+        from src.beliefs import BELIEF_MODE_TO_CLS  # Import here to avoid circular import issues
+        if 'prior' in data and data['prior']:
+            belief_cls = BELIEF_MODE_TO_CLS[data['prior']['_type']]
+            self.prior = belief_cls.DistributionFormat(**data['prior'])
+        if 'posterior' in data and data['posterior']:
+            belief_cls = BELIEF_MODE_TO_CLS[data['posterior']['_type']]
+            self.posterior = belief_cls.DistributionFormat(**data['posterior'])
+        self.belief_change = data.get('belief_change', self.belief_change)
+
+    def get_next_experiment(self, experiment_generator=None, n_retry=3):
         """
-        Returns the next untried experiment. If none left and allowed, generates more using the experiment generator agent.
+        Returns the next untried experiment. If none left and generating experiments is allowed, generates more using
+        the experiment generator agent.
         """
-        exp, hypothesis, new_query = None, None, None
+        new_experiment, new_query = None, None
 
-        if self.untried_experiments:
-            idx = random.randrange(len(self.untried_experiments))
-            exp = self.untried_experiments.pop(idx)
-            self.tried_experiments.append(exp)
-        elif self.allow_generate_experiments and experiment_generator_agent is not None:
-            # Generate new experiments on demand
-            # Provide all previous messages and tried experiments as context
-            prompt = {
-                "role": "user",
-                "content": f"Generate new experiments given the following context. Previously tried experiments: {json.dumps(self.tried_experiments)}"
-            }
-            messages = self.messages + [prompt]
-            reply = experiment_generator_agent.generate_reply(messages=messages)
-            try:
-                experiments = json.loads(reply).get("experiments", [])
-            except (json.JSONDecodeError, TypeError):
-                experiments = []
-            self.untried_experiments = experiments.copy()
+        if n_retry > 0:
             if self.untried_experiments:
                 idx = random.randrange(len(self.untried_experiments))
-                exp = self.untried_experiments.pop(idx)
-                self.tried_experiments.append(exp)
+                new_experiment = self.untried_experiments.pop(idx)
+                self.tried_experiments.append(new_experiment)
+            elif self.allow_generate_experiments and experiment_generator is not None:
+                # Generate new experiments on-demand, providing all previous experiments as context
+                _messages = self.messages + [{
+                    "role": "user",
+                    "content": f"Generate new experiments given these previously attempted experiments: {json.dumps(self.tried_experiments)}"
+                }]
+                _reply = experiment_generator.generate_reply(messages=_messages)
+                try:
+                    experiments = try_loading_dict(_reply).get("experiments", [])
+                except (json.JSONDecodeError, TypeError):
+                    experiments = []
+                self.untried_experiments = experiments.copy()
+                if self.untried_experiments:
+                    idx = random.randrange(len(self.untried_experiments))
+                    new_experiment = self.untried_experiments.pop(idx)
+                    self.tried_experiments.append(new_experiment)
 
-        if exp is not None:
-            try:
-                hypothesis = exp['hypothesis']
-                exp_plan = exp['experiment_plan']
-                new_query = ""
-                if hypothesis is not None:
-                    new_query += f"Hypothesis: {hypothesis}\n\n"
-                new_query += f"""\
-Experiment objective: {exp_plan['objective']}
+            if new_experiment is not None:
+                try:
+                    new_query = get_query_from_experiment(new_experiment)
+                except:
+                    pass
+            if new_query is None:
+                return self.get_next_experiment(experiment_generator=experiment_generator, n_retry=n_retry - 1)
 
-Steps for the programmer:
-{exp_plan['steps']}
-
-Deliverables:
-{exp_plan['deliverables']}"""
-            except Exception as e:
-                print(f"Error processing proposed experiment: {e}")
-                print("Getting next experiment...")
-                # Recurse with get_next_experiment
-                return self.get_next_experiment(experiment_generator_agent=experiment_generator_agent)
-
-        return exp, hypothesis, new_query
+        return new_experiment, new_query
 
     def has_untried_experiments(self):
         return bool(self.untried_experiments) or self.allow_generate_experiments
@@ -120,14 +157,10 @@ Deliverables:
     def to_dict(self):
         return {
             "id": self.id,
+            "success": self.success,
             "parent_id": self.parent_id,
-            "successful": self.successful,
-            "level": self.level,
-            "node_idx": self.node_idx,
-            "parent_idx": self.parent_idx,
-            "creation_index": self.creation_index,
-            "timestamp": self.timestamp,
-            "hypothesis": self.hypothesis,
+            "creation_idx": self.creation_idx,
+            "time_elapsed": self.time_elapsed,
             "visits": self.visits,
             "value": self.value,
             "self_value": self.self_value,
@@ -135,24 +168,35 @@ Deliverables:
             "belief_change": self.belief_change,
             "prior": self.prior.to_dict() if self.prior else None,
             "posterior": self.posterior.to_dict() if self.posterior else None,
+            "hypothesis": self.hypothesis,
+            "experiment_plan": self.experiment_plan,
+            "code": self.code,
+            "code_output": self.code_output,
+            "analysis": self.analysis,
+            "review": self.review,
+            "untried_experiments": self.untried_experiments,
+            "tried_experiments": self.tried_experiments,
             "query": self.query,
             "messages": self.messages,
         }
 
-    def get_context(self, include_code_output=False) -> None | str:
-        """Returns minimal set of messages containing latest experiment, program, and analysis."""
-        if len(self.messages) == 0:
-            return None
-
+    def read_experiment_from_messages(self, store_new_experiments=False):
+        """Extracts experiment details from messages and updates the node's attributes."""
         latest_experiment = None
+        was_revised = False
         latest_programmer = None
         latest_code_executor = None
         latest_analyst = None
         latest_reviewer = None
+        latest_reviewer_feedback = "N/A"
+        latest_reviewer_success = False
+        latest_experiment_generator = None
 
         for msg in reversed(self.messages):
             if not latest_experiment and msg.get("name") in ["user_proxy", "experiment_reviser"]:
                 latest_experiment = msg.get("content")
+                if msg.get("name") == "experiment_reviser":
+                    was_revised = True
             elif not latest_programmer and msg.get("name") == "experiment_programmer":
                 latest_programmer = try_loading_dict(msg.get("content")).get("code", "N/A")
             elif not latest_code_executor and msg.get("name") == "code_executor":
@@ -160,23 +204,43 @@ Deliverables:
             elif not latest_analyst and msg.get("name") in ["experiment_analyst", "experiment_code_analyst"]:
                 latest_analyst = try_loading_dict(msg.get("content")).get("analysis", "N/A")
             elif not latest_reviewer and msg.get("name") == "experiment_reviewer":
-                latest_reviewer = try_loading_dict(msg.get("content")).get("feedback", "N/A")
-                if latest_reviewer == "":
-                    latest_reviewer = "N/A"
+                latest_reviewer = try_loading_dict(msg.get("content"))
+                latest_reviewer_feedback = latest_reviewer.get("feedback", "N/A")
+                if latest_reviewer_feedback == "":
+                    latest_reviewer_feedback = "N/A"
+                latest_reviewer_success = latest_reviewer.get("success", False)
+            elif not latest_experiment_generator and msg.get("name") == "experiment_generator":
+                latest_experiment_generator = try_loading_dict(msg.get("content")).get("experiments", [])
 
-            if latest_experiment and latest_programmer and latest_code_executor and latest_analyst and latest_reviewer:
+            if (latest_experiment and latest_programmer and
+                    latest_code_executor and latest_analyst and latest_reviewer):
                 break
 
-        context_str = latest_experiment + "\n\n"
+        if was_revised:
+            latest_experiment_obj = try_loading_dict(latest_experiment)
+            # Change what the query should now be based on the revised experiment
+            self.query = get_query_from_experiment(latest_experiment_obj)
+        else:
+            latest_experiment_obj = get_experiment_from_query(latest_experiment)  # assuming it is a query string
 
-        if include_code_output:
-            context_str += f"Code Output:\n{latest_code_executor}\n\n"
+        self.hypothesis = latest_experiment_obj.get("hypothesis", "N/A")
+        self.experiment_plan = latest_experiment_obj.get("experiment_plan", "N/A")
+        self.code = latest_programmer
+        self.code_output = latest_code_executor
+        self.analysis = latest_analyst
+        self.review = latest_reviewer_feedback
+        self.success = latest_reviewer_success
 
-        context_str += f"""\
-Analysis: {latest_analyst}
+        # Store new experiments into untried_experiments
+        if store_new_experiments and latest_experiment_generator:
+            self.untried_experiments += latest_experiment_generator
 
-Review: {latest_reviewer}"""
-
+    def get_context(self, include_code_output=False) -> None | str:
+        """Returns the node's hypothesis, experiment, output, analysis, and review."""
+        if len(self.messages) == 0:
+            return None
+        context_str = get_context_string(self.query, self.code_output, self.analysis, self.review,
+                                         include_code_output=include_code_output)
         return context_str
 
     def get_path_context(self, k: Optional[int] = None, skip_root=True) -> None | list:

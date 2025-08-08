@@ -3,6 +3,7 @@ from pydantic import BaseModel, Field
 import tiktoken
 
 from src.mcts import MCTSNode
+from src.mcts_utils import get_context_string
 from src.utils import query_llm
 
 
@@ -548,50 +549,31 @@ def calculate_prior_and_posterior_beliefs(node, n_samples=4, model="gpt-4o", tem
         node: MCTSNode instance containing node information and messages or a dictionary with node data
     """
 
-    MODEL_CTXT_LIMITS = {
-        "o4-mini": 200_000,
-        "gpt-4o": 128_000,
-    }
+    # MODEL_CTXT_LIMITS = {
+    #     "o4-mini": 200_000,
+    #     "gpt-4o": 128_000,
+    # }
 
     if type(node) is MCTSNode:
         hypothesis = node.hypothesis
-        if type(hypothesis) is dict:
-            hypothesis = hypothesis["hypothesis"]
-        messages = node.messages or []
+        query = node.query  # Contains the hypothesis and experiment plan
+        code_output = node.code_output
+        analysis = node.analysis
+        review = node.review
     else:
-        hypothesis = node.get("hypothesis", None)
-        if type(hypothesis) is dict:
-            hypothesis = hypothesis["hypothesis"]
-        messages = node.get("messages", [])
+        hypothesis = node["hypothesis"]
+        query = node.get("query", "N/A")
+        code_output = node.get("code_output", "N/A")
+        analysis = node.get("analysis", "N/A")
+        review = node.get("review", "N/A")
 
-    # Only include the latest experiment plan or experiment reviser, programmer, and analyst messages
-    latest_experiment = None
-    latest_programmer = None
-    latest_code_executor = None
-    latest_analyst = None
+    if hypothesis is None:
+        return None, None, None, None
 
-    for msg in reversed(messages):
-        if not latest_experiment and msg.get("name") in ["user_proxy", "experiment_reviser"]:
-            latest_experiment = msg
-        elif not latest_programmer and msg.get("name") == "experiment_programmer":
-            latest_programmer = msg
-        elif not latest_analyst and msg.get("name") in ["experiment_analyst", "experiment_code_analyst"]:
-            latest_analyst = msg
-        elif not latest_code_executor and msg.get("name") == "code_executor":
-            latest_code_executor = msg
-            # Make sure the input tokens do not exceed 200,000 tokens
-            encoding = tiktoken.encoding_for_model("gpt-4o")  # Currently, "o4-mini" raises an error
-            input_tokens = len(encoding.encode(latest_code_executor["content"]))
-            if input_tokens > (MODEL_CTXT_LIMITS[model] - 10_000):  # Reserve 10k tokens for all other messages
-                # Truncate the content of the code executor from the beginning
-                latest_code_executor["content"] = encoding.decode(
-                    encoding.encode(latest_code_executor["content"])[-int(MODEL_CTXT_LIMITS[model] - 10_000):]
-                )
-
-        if latest_experiment and latest_programmer and latest_analyst and latest_code_executor:
-            break
-
-    evidence = [m for m in [latest_experiment, latest_programmer, latest_code_executor, latest_analyst] if m]
+    evidence_msg = [{
+        "role": "user",
+        "content": get_context_string(query, code_output, analysis, review, include_code_output=True)
+    }]
 
     prior, prior_mean = get_belief(
         hypothesis=hypothesis,
@@ -605,7 +587,7 @@ def calculate_prior_and_posterior_beliefs(node, n_samples=4, model="gpt-4o", tem
     )
     posterior, posterior_mean = get_belief(
         hypothesis=hypothesis,
-        evidence=evidence,
+        evidence=evidence_msg,
         model=model,
         belief_mode=belief_mode,
         n_samples=n_samples,
@@ -618,8 +600,7 @@ def calculate_prior_and_posterior_beliefs(node, n_samples=4, model="gpt-4o", tem
     if prior is None or posterior is None:
         return None, None, None, None
 
-    belief_change = abs(posterior_mean - prior_mean)
+    belief_change = abs(posterior_mean - prior_mean)  # TODO: KL?
     is_surprisal = belief_change >= surprisal_width
-    # is_surprisal_in_diff_02buckets = (prior_mean*10)//2 != (posterior_mean*10)//2
 
     return is_surprisal, belief_change, prior, posterior

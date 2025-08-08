@@ -146,3 +146,26 @@ def get_datasets_fpaths(dataset_metadata: str, is_blade=False) -> list:
         paths.append(os.path.join(metadata_parent_path, "data.csv"))
 
     return paths
+
+
+def get_load_dataset_experiment(dataset_paths, args):
+    # Set up the initial experiment to load the dataset
+    load_dataset_objective = "Load the dataset and generate summary statistics. "
+    load_dataset_steps = f"1. Load the dataset(s) at {[os.path.basename(dp) for dp in dataset_paths]}.\n2. Generate summary statistics for the dataset(s)."
+    load_dataset_deliverables = "1. Dataset(s) loaded.\n2. Summary statistics generated."
+    if args.run_eda:
+        load_dataset_steps += "\n3. Perform some exploratory data analysis (EDA) on the dataset(s) to get a better understanding of the data."
+        load_dataset_deliverables += "\n3. Exploratory data analysis (EDA) performed."
+    if args.dataset_metadata_type == 'blade':
+        load_dataset_objective += f"Here is the dataset metadata:\n\n{get_blade_description(args.dataset_metadata)}"
+    else:  # DiscoveryBench-style
+        load_dataset_objective += f"Here is the dataset metadata:\n\n{get_dataset_description(args.dataset_metadata)}"
+    load_dataset_experiment = {
+        "hypothesis": None,
+        "experiment_plan": {
+            "objective": load_dataset_objective,
+            "steps": load_dataset_steps,
+            "deliverables": load_dataset_deliverables
+        }
+    }
+    return load_dataset_experiment

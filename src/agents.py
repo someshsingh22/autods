@@ -72,7 +72,7 @@ def image_to_text():
             analysis = response.choices[0].message.content
             print(f"\\n=== Plot Analysis (fig. {fig_num}) ===\\n")
             print(analysis)
-            print("="*50)
+            print("\\n" + "="*50)
 
         plt.close(fig)
 
@@ -131,7 +131,7 @@ def get_openai_config(api_key: str | None = None, temperature: float | None = No
 
 
 def get_agents(work_dir, model_name="o4-mini", temperature=None, reasoning_effort=None, branching_factor=3,
-               user_query=None, experiment_first=False) -> list[ConversableAgent]:
+               user_query=None, experiment_first=False, code_timeout=30 * 60) -> dict[str, ConversableAgent]:
     llm_config = get_openai_config(api_key=os.getenv("OPENAI_API_KEY"), model_name=model_name, temperature=temperature,
                                    reasoning_effort=reasoning_effort)
 
@@ -217,7 +217,7 @@ def install(package):
             'If the code includes a line "# [debug]" i.e "[debug]" as a comment, strictly treat this as a debugging experiment. '
             'In such cases, strictly return the success status as **false**, provide information that it was a debug code execution, '
             'give feedback and request the experiment to be retried with the new information. '
-            'Otherwise, analyze the results and provide a short summary of the findings from the current experiment.'
+            'Otherwise, analyze the results and provide a short summary of the code output.'
         ),
         human_input_mode="NEVER",
     )
@@ -229,7 +229,8 @@ def install(package):
         system_message=(
             'You are a research scientist responsible for holistically reviewing the entire experiment pipeline, i.e., the generated code, the output, and the analysis w.r.t. the original experiment plan. '
             'Assess whether the experiment was faithfully implemented, i.e., whether the implementation follows the experiment plan without significant deviation and whether the hypothesis was in fact tested sufficiently. '
-            'If you find issues or inconsistencies in any part of the experiment pipeline, provide feedback about what is wrong.'
+            'If you find issues or inconsistencies in any part of the experiment pipeline, return the success status as **false** and provide feedback about what is wrong. '
+            'Otherwise, return the success status as **true** and provide a summary of the hypothesis, experiment results, and findings.'
         ),
         human_input_mode="NEVER",
     )
@@ -252,7 +253,7 @@ def install(package):
 
     ## Timeout Code Executor
     executor = LocalCommandLineCodeExecutor(
-        timeout=30 * 60,  # Timeout in seconds
+        timeout=code_timeout,  # Timeout in seconds
         work_dir=work_dir,
         # virtual_env_context=create_virtual_env(os.path.join(work_dir, ".venv"))
     )
@@ -288,4 +289,5 @@ def install(package):
     for agent in agents:
         token_limit_capability.add_to_agent(agent)
 
-    return agents
+    agents_dict = {agent.name: agent for agent in agents}
+    return agents_dict

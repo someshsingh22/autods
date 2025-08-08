@@ -67,6 +67,7 @@ class Experiment(BaseModel):
     hypothesis: str
     experiment_plan: ExperimentPlan
 
+
 class ExperimentHypothesis(BaseModel):
     """
         Represents an experiment with an experiment plan and a hypothesis.
@@ -87,6 +88,7 @@ class ExperimentList(BaseModel):
         experiments (list[Experiment]): List of Experiment objects
     """
     experiments: list[Experiment]
+
 
 class ExperimentHypothesisList(BaseModel):
     """
@@ -123,11 +125,11 @@ class ExperimentAnalyst(BaseModel):
     Analysis of experiment results.
 
     Attributes:
-        success (bool): Whether the experiment was successful
         analysis (Optional[str]): Detailed analysis of the experiment outcomes
+        success (bool): Whether the experiment was successful
     """
-    success: bool
     analysis: str
+    success: bool
 
     @model_validator(mode='after')
     def analysis_required_on_success(self) -> Self:
@@ -141,14 +143,14 @@ class ExperimentReviewer(BaseModel):
     Review of an experiment's execution and results.
 
     Attributes:
-        success (bool): Whether the experiment was successful
         feedback (str | None): Required feedback when experiment fails, optional otherwise
+        success (bool): Whether the experiment was successful
 
     Raises:
         ValueError: If success is False and no feedback is provided
     """
-    success: bool
     feedback: str
+    success: bool
 
     @model_validator(mode='after')
     def feedback_required_on_failure(self) -> Self:

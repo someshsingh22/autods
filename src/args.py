@@ -25,8 +25,8 @@ class ArgParser(argparse.ArgumentParser):
                           help='Path to mcts_nodes.json file to continue exploration from')
         self.add_argument('--n_experiments', type=int, help='Number of MCTS iterations (max_iterations)', required=True)
         self.add_argument('--k_experiments', type=int, default=8, help='Branching factor for experiments (>= 1)')
-        self.add_argument('--allow_generate_experiments', action=argparse.BooleanOptionalAction, default=False,
-                          help='Allow nodes to generate new experiments on demand')
+        self.add_argument('--allow_generate_experiments', action=argparse.BooleanOptionalAction, default=True,
+                          help='Allow nodes to generate new experiments on-demand')
         self.add_argument('--n_belief_samples', type=int, default=30,
                           help='Number of samples for belief distribution evaluation')
         self.add_argument('--timestamp_dir', action=argparse.BooleanOptionalAction, default=True,
@@ -42,7 +42,8 @@ class ArgParser(argparse.ArgumentParser):
         self.add_argument('--use_beam_search', action=argparse.BooleanOptionalAction, default=False,
                           help='Use beam search selection method')
         self.add_argument("--mcts_selection", type=str, choices=['ucb1', 'beam_search', 'pw'],
-                            default='pw', help="Selection method to use in MCTS (UCB1, beam search, or progressive widening)")
+                          default='pw',
+                          help="Selection method to use in MCTS (UCB1, beam search, or progressive widening)")
         self.add_argument('--pw_k', type=float, help='Progressive widening constant k', default=1.0)
         self.add_argument('--pw_alpha', type=float, help='Progressive widening exponent alpha', default=0.5)
         self.add_argument('--k_parents', type=int, default=3,
@@ -63,3 +64,7 @@ class ArgParser(argparse.ArgumentParser):
                           help='Only save results without running MCTS')
         self.add_argument('--experiment_first', action=argparse.BooleanOptionalAction, default=False,
                           help='Generate experiments before hypotheses')
+        self.add_argument('--code_timeout', type=int, default=30 * 60,
+                          help='Timeout for code execution in seconds')
+        self.add_argument('--run_eda', action=argparse.BooleanOptionalAction, default=False,
+                          help='Run EDA as part of the initial experiment')

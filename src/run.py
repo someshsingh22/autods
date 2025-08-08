@@ -1,25 +1,25 @@
 import os
 import json
 from collections import defaultdict
+from time import time
 
 from src.agents import get_agents
 from src.mcts import MCTSNode, default_mcts_selection, beam_search, progressive_widening
-from src.dataset import get_dataset_description, get_blade_description, get_datasets_fpaths
+from src.dataset import get_datasets_fpaths, get_load_dataset_experiment
 from src.logger import TreeLogger
 
 from src.beliefs import calculate_prior_and_posterior_beliefs
 from datetime import datetime
 import shutil
-from openai import BadRequestError as OpenAIBadRequestError
 
 from src.args import ArgParser
 from src.mcts_utils import load_mcts_from_json, save_nodes, get_msgs_from_latest_query, setup_group_chat, \
     print_node_info
-from src.utils import try_loading_dict
 
 
 def run_mcts(
-        query,
+        root,
+        nodes_by_level,
         dataset_paths,
         log_dirname,
         work_dir,
@@ -31,8 +31,6 @@ def run_mcts(
         selection_method=None,
         allow_generate_experiments=False,
         n_belief_samples=30,
-        root=None,
-        nodes_by_level=None,
         k_parents=3,
         temperature=1.0,
         belief_temperature=1.0,
@@ -43,13 +41,15 @@ def run_mcts(
         belief_mode="categorical",
         use_binary_reward=True,
         run_dedupe=True,
-        experiment_first=False
+        experiment_first=False,
+        code_timeout=30*60
 ):
     """
     Run AutoDS exploration. In MCTS, root node level=0 is a dummy node with no experiment, level=1 is the first real node with the dataset loading experiment, levels > 1 are the actual MCTS nodes with hypotheses and experiments.
 
     Args:
-        query: Initial query to start the exploration.
+        root: Root MCTSNode to continue from. If None, initializes a new root.
+        nodes_by_level: Dictionary to store nodes by level. If None, initializes a new one.
         dataset_paths: List of paths to dataset files.
         log_dirname: Directory to save logs and MCTS nodes.
         work_dir: Working directory for agents.
@@ -61,8 +61,6 @@ def run_mcts(
         selection_method: Function to select nodes in MCTS (default is UCB1).
         allow_generate_experiments: Whether to allow nodes to generate new experiments on demand.
         n_belief_samples: Number of samples for belief distribution evaluation.
-        root: Optional root MCTSNode to continue from. If None, initializes a new root.
-        nodes_by_level: Optional dictionary to store nodes by level. If None, initializes a new one.
         k_parents: Number of parent levels to include in logs (None for all).
         temperature: Temperature setting for all agents (except belief agent).
         belief_temperature: Temperature setting for the belief agent.
@@ -74,9 +72,13 @@ def run_mcts(
         use_binary_reward: Whether to use binary reward for MCTS instead of a continuous reward (belief change).
         run_dedupe: Whether to deduplicate nodes before saving to JSON and CSV.
         experiment_first: If True, an experiment will be generated before its hypothesis.
+        code_timeout: Timeout for code execution in seconds (default is 30 minutes).
     """
     # Setup logger
     logger = TreeLogger(log_dirname)
+
+    # Track time
+    start_time = time()
 
     # Create work directory if it doesn't exist
     os.makedirs(work_dir, exist_ok=True)
@@ -85,12 +87,12 @@ def run_mcts(
     for dataset_fpath in dataset_paths:
         shutil.copy(dataset_fpath, work_dir)
 
-    # Get the structured agents
-    structured_agents = get_agents(work_dir, model_name=model_name, temperature=temperature,
-                                   reasoning_effort=reasoning_effort, branching_factor=branching_factor,
-                                   user_query=user_query, experiment_first=experiment_first)
-    agent_objs = {agent.name: agent for agent in structured_agents}
+    # Get agents
+    agent_objs = get_agents(work_dir, model_name=model_name, temperature=temperature,
+                            reasoning_effort=reasoning_effort, branching_factor=branching_factor,
+                            user_query=user_query, experiment_first=experiment_first, code_timeout=code_timeout)
     user_proxy = agent_objs["user_proxy"]
+    experiment_generator = agent_objs["experiment_generator"]
 
     # Set up the group chat
     groupchat, chat_manager = setup_group_chat(agent_objs, max_rounds)
@@ -99,33 +101,22 @@ def run_mcts(
         # Default selection method is UCB1
         selection_method = default_mcts_selection(exploration_weight=1.0)
 
-    # Initialize the root node if not continuing from saved state
-    if root is None:
-        root = MCTSNode(level=0, node_idx=0, hypothesis=None, query=None, untried_experiments=[query],
-                        allow_generate_experiments=False)
-        nodes_by_level = defaultdict(list)
-        nodes_by_level[0].append(root)
-
-    experiment_generator_agent = agent_objs["experiment_generator"]
-
     try:
         for iteration_idx in range(max_iterations):
             # MCTS SELECTION, EXPANSION, and EXECUTION
             print(f"\n\n######### ITERATION {iteration_idx + 1} / {max_iterations} #########\n")
+
+            # Select the next node to expand
             node = selection_method(root)
-
-            exp, new_hypothesis, new_query = node.get_next_experiment(
-                experiment_generator_agent=experiment_generator_agent)
-
+            # Fetch or generate the next experiment from the selected node (retries built in)
+            new_experiment, new_query = node.get_next_experiment(experiment_generator=experiment_generator)
             if new_query is not None:
+                # Create a new node for the next experiment
                 new_level = node.level + 1
                 new_node_idx = len(nodes_by_level[new_level])
-                allow_generate = allow_generate_experiments if new_level > 0 else False
-                child = MCTSNode(level=new_level, node_idx=new_node_idx, hypothesis=new_hypothesis, query=new_query,
-                                 parent=node, allow_generate_experiments=allow_generate)
-                node.children.append(child)
-                nodes_by_level[new_level].append(child)
-                node = child
+                node = MCTSNode(level=new_level, node_idx=new_node_idx, hypothesis=new_experiment["hypothesis"],
+                                experiment_plan=new_experiment["experiment_plan"], query=new_query, parent=node,
+                                allow_generate_experiments=allow_generate_experiments and new_level > 0)
 
                 # Update logger state
                 logger.level = node.level
@@ -145,18 +136,21 @@ def run_mcts(
                     {"name": "user_proxy", "role": "user", "content": node.query}]
                 _, last_message = chat_manager.resume(messages=node_messages)
 
-                # Generate new experiments
-                user_proxy.initiate_chat(recipient=chat_manager, message=last_message, clear_history=False)
-                logger.log_node(node.level, node.node_idx, chat_manager.messages_to_string(groupchat.messages))
-                node.messages = get_msgs_from_latest_query(groupchat.messages)
+                # Track time per node
+                _node_start_time = time()
 
-                # Store generated experiments
-                assert node.messages[-1]['name'] == "experiment_generator"
-                experiments = try_loading_dict(node.messages[-1]['content']).get('experiments', [])
-                node.untried_experiments += experiments
+                # Execute current experiment and generate new experiments
+                user_proxy.initiate_chat(recipient=chat_manager, message=last_message, clear_history=False)
+
+                # Store the raw message logs for the node
+                logger.log_node(node.level, node.node_idx, chat_manager.messages_to_string(groupchat.messages))
+
+                # Get messages starting from the current query and update the node
+                node.messages = get_msgs_from_latest_query(groupchat.messages)
+                node.read_experiment_from_messages(store_new_experiments=True)
 
                 # Calculate beliefs and rewards
-                if node.successful and node.level > 1:
+                if node.success and node.level > 1:
                     # Belief elicitation
                     is_surprisal, belief_change, prior, posterior = calculate_prior_and_posterior_beliefs(
                         node,
@@ -182,22 +176,35 @@ def run_mcts(
                         print_node_info(node)
                     else:
                         print(f"Skipping node {node.level}_{node.node_idx} due to belief calculation failure.")
-                        node._successful = False
+                        node.success = False
                         continue
 
-            # MCTS BACKPROPAGATION
-            node.update_counts(visits=1, reward=node.self_value)
+                # End time tracking for the node
+                _node_end_time = time()
+                node.time_elapsed = round(_node_end_time - _node_start_time, 2)
 
-            # Save the individual node after backpropagation
-            node_file = os.path.join(log_dirname, f"mcts_{node.id}.json")
-            with open(node_file, "w") as f:
-                json.dump(node.to_dict(), f, indent=2)
+                # Add the new node to the nodes_by_level dictionary
+                nodes_by_level[new_level].append(node)
 
+                # MCTS BACKPROPAGATION
+                node.update_counts(visits=1, reward=node.self_value)
+
+                # Save the current state of the node
+                node_file = os.path.join(log_dirname, f"mcts_{node.id}.json")
+                with open(node_file, "w") as f:
+                    json.dump(node.to_dict(), f, indent=2)
+            else:
+                # No new experiment was generated; don't change the state of the tree and sample again
+                print(f"No new experiment generated for node {node.level}_{node.node_idx}. Skipping this iteration.")
     except KeyboardInterrupt:
         print("\n\n######### EXPLORATION INTERRUPTED! SAVING THE CURRENT STATE... #########\n\n")
 
+    # End time tracking
+    end_time = time()
+    time_elapsed = end_time - start_time
+
     # Save all MCTS nodes
-    save_nodes(nodes_by_level, log_dirname, run_dedupe, belief_model_name)
+    save_nodes(nodes_by_level, log_dirname, run_dedupe, belief_model_name, time_elapsed=time_elapsed)
 
 
 if __name__ == "__main__":
@@ -230,17 +237,18 @@ if __name__ == "__main__":
 
     # Get dataset paths
     dataset_paths = get_datasets_fpaths(args.dataset_metadata, is_blade=args.dataset_metadata_type == 'blade')
+    load_dataset_experiment = get_load_dataset_experiment(dataset_paths, args)
 
     if args.continue_from_dir or args.continue_from_json:
         if args.continue_from_dir is not None:
-            # Load nodes from directory
+            # Load nodes from a directory
             root, nodes_by_level = load_mcts_from_json(args.continue_from_dir, args)
             # Copy all files except args.json from continue_from_dir to the new log directory
             for filename in os.listdir(args.continue_from_dir):
                 if filename != "args.json":
                     shutil.copy(os.path.join(args.continue_from_dir, filename), os.path.join(log_dirname, filename))
         else:
-            # Load from collected JSON file
+            # Load from a JSON file that contains all the nodes (not de-duplicated)
             root, nodes_by_level = load_mcts_from_json(args.continue_from_json, args)
 
         if args.only_save_results:
@@ -248,8 +256,18 @@ if __name__ == "__main__":
             save_nodes(nodes_by_level, log_dirname, run_dedupe=args.dedupe, model=args.belief_model)
             exit(0)
 
-        # Load MCTS state
-        query = root.children[0].query if root.children else None
+        if args.continue_from_dir is not None:
+            # Copy all files except args.json from continue_from_dir to the new log directory
+            for filename in os.listdir(args.continue_from_dir):
+                if filename != "args.json":
+                    shutil.copy(os.path.join(args.continue_from_dir, filename), os.path.join(log_dirname, filename))
+        else:
+            # Create the individual node files in the log directory
+            for node in nodes_by_level.values():
+                for n in node:
+                    node_file = os.path.join(log_dirname, f"mcts_{n.id}.json")
+                    with open(node_file, "w") as f:
+                        json.dump(n.to_dict(), f, indent=2)
 
         # Calculate remaining iterations to reach n_experiments
         total_nodes = sum(len(nodes) for nodes in nodes_by_level.values())
@@ -260,26 +278,11 @@ if __name__ == "__main__":
         print(
             f"RESUMING: Running {remaining_iters} more experiments to reach the target experiment count of {args.n_experiments}.\n")
     else:
-        root = None
-        nodes_by_level = None
+        root = MCTSNode(level=0, node_idx=0, hypothesis=None, query=None,
+                        allow_generate_experiments=False, untried_experiments=[load_dataset_experiment])
+        nodes_by_level = defaultdict(list)
+        nodes_by_level[0].append(root)
         remaining_iters = args.n_experiments + 1  # + 1 to account for root node
-        load_dataset_objective = "Load the dataset and generate summary statistics. "
-        load_dataset_steps = f"1. Load the dataset(s) at {[os.path.basename(dp) for dp in dataset_paths]}.\n2. Generate summary statistics for the dataset(s).\n3. Perform some exploratory data analysis (EDA) on the dataset(s) to get a better understanding of the data."
-        load_dataset_deliverables = "1. Dataset(s) loaded.\n2. Summary statistics generated.\n3. Exploratory data analysis (EDA) performed."
-
-        if args.dataset_metadata_type == 'blade':
-            load_dataset_objective += f"Here is the dataset metadata:\n\n{get_blade_description(args.dataset_metadata)}"
-        else:  # DiscoveryBench-style
-            load_dataset_objective += f"Here is the dataset metadata:\n\n{get_dataset_description(args.dataset_metadata)}"
-
-        query = {
-            "hypothesis": None,
-            "experiment_plan": {
-                "objective": load_dataset_objective,
-                "steps": load_dataset_steps,
-                "deliverables": load_dataset_deliverables
-            }
-        }
 
     # Set up selection method based on args
     if args.mcts_selection == "pw":
@@ -298,7 +301,8 @@ if __name__ == "__main__":
 
     # Run exploration
     run_mcts(
-        query=query,
+        root=root,
+        nodes_by_level=nodes_by_level,
         dataset_paths=dataset_paths,
         log_dirname=log_dirname,
         work_dir=work_dirname,
@@ -307,8 +311,6 @@ if __name__ == "__main__":
         selection_method=selection_method,
         allow_generate_experiments=args.allow_generate_experiments,
         n_belief_samples=args.n_belief_samples,
-        root=root,
-        nodes_by_level=nodes_by_level,
         k_parents=args.k_parents,
         model_name=args.model,
         belief_model_name=args.belief_model,
@@ -321,7 +323,8 @@ if __name__ == "__main__":
         belief_mode=args.belief_mode,
         use_binary_reward=args.use_binary_reward,
         run_dedupe=args.dedupe,
-        experiment_first=args.experiment_first
+        experiment_first=args.experiment_first,
+        code_timeout=args.code_timeout
     )
 
     if args.delete_work_dir:

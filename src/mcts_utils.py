@@ -1,87 +1,109 @@
 import json
 import os
+import regex as re
 from collections import defaultdict
 from typing import List, Dict
+from glob import glob
 
 from autogen import GroupChat, GroupChatManager
 
-from src.beliefs import BELIEF_MODE_TO_CLS
 from src.deduplication import dedupe
-from src.mcts import MCTSNode
 from src.nodes_to_csv import nodes_to_csv
-from src.reconstruct_mcts import collect_logs_for_resumption
 from src.transitions import SpeakerSelector
 
 
-def load_mcts_from_json(json_obj_or_file_or_dir, args):
+def load_mcts_from_json(json_obj_or_file_or_dir, args, replay_mcts=True):
     """Load and reconstruct MCTS nodes from a JSON object, log file, or directory.
 
     Args:
         json_obj_or_file_or_dir: Loaded JSON object or a path to the mcts_nodes.json file or to a directory with mcts_node_*.json files.
 
     Returns:
-        root: The root MCTSNode
+        root: Root MCTSNode
         nodes_by_level: Dictionary mapping levels to lists of MCTSNodes
     """
-    if type(json_obj_or_file_or_dir) is str:
-        if os.path.isdir(json_obj_or_file_or_dir):
-            node_data = collect_logs_for_resumption(json_obj_or_file_or_dir)
-        else:
-            with open(json_obj_or_file_or_dir, 'r') as f:
-                node_data = json.load(f)
-    else:
-        node_data = json_obj_or_file_or_dir
+    from src.mcts import MCTSNode  # Import here to avoid circular import issues
 
-    # Initialize storage
+    node_data = get_nodes(json_obj_or_file_or_dir)
+
+    # Initialize tree data structures
     nodes_by_level = defaultdict(list)
     node_map = {}  # Map (level, idx) to node objects for linking
 
-    # First pass - create all nodes
+    # Iterate over the nodes in level order and build the tree
+    node_data.sort(key=lambda x: (int(x['id'].split('_')[1]), int(x['id'].split('_')[2])))
     for data in node_data:
-        level = data['level']
-        node_idx = data['node_idx']
-        parent_idx = data['parent_idx']
+        # Create an empty node and initialize from dict (parent links added in second pass)
+        node = MCTSNode(allow_generate_experiments=args.allow_generate_experiments)
+        node.init_from_dict(data)
+        # Add to data structures
+        nodes_by_level[node.level].append(node)
+        node_map[(node.level, node.node_idx)] = node
+        # Link to parent
+        if node.parent_id is not None:
+            parent_level = node.level - 1
+            parent_idx = node.parent_idx
+            try:
+                node.parent = node_map[(parent_level, parent_idx)]
+                node.parent.children.append(node)
+            except KeyError:
+                assert (parent_level, parent_idx) == (
+                    0, 0), f"Parent node ({parent_level}, {parent_idx}) not found in node_map."
 
-        # Create node (parent links added in second pass)
-        node = MCTSNode(level=level, node_idx=node_idx, parent_idx=parent_idx, hypothesis=data['hypothesis'],
-                        query=data['query'])
-        node.visits = data['visits']
-        node.value = data['value']
-        node.surprising = data['surprising']
-        node.belief_change = data.get('belief_change', None)
-        node.messages = data['messages']
-        node.creation_index = data['creation_index']
-        node.timestamp = data.get('timestamp', None)
+    # Create root node if it does not exist
+    if (0, 0) not in node_map:
+        node = MCTSNode(level=0, node_idx=0, creation_idx=0)
+        nodes_by_level[0].append(node)  # Figure out creation_idx use
+        node_map[(0, 0)] = node
+        # Link root to the tree
+        node.children = [node_map[(1, 0)]]
+        node_map[(1, 0)].parent = node
 
-        # All nodes except root can generate experiments
-        if level > 0:
-            node.allow_generate_experiments = args.allow_generate_experiments
+    assert len(node_map) == MCTSNode._creation_counter
+    root = node_map[(0, 0)]
 
-        if data['prior']:
-            node.prior = BELIEF_MODE_TO_CLS[data['prior']['_type']].DistributionFormat(**data['prior'])
-        if data['posterior']:
-            node.posterior = BELIEF_MODE_TO_CLS[data['posterior']['_type']].DistributionFormat(**data['posterior'])
+    # Fix tried/untried experiments
+    for node in node_map.values():
+        _tried_experiments, _untried_experiments = [], []
+        cur_untried_experiments = set(list(map(get_query_from_experiment, node.untried_experiments)))
+        for child in node.children:
+            # Keep only children in tried experiments
+            _tried_experiments.append(get_experiment_from_query(child.query))
+            # Remove child from untried experiments if exists
+            if child.query in cur_untried_experiments:
+                cur_untried_experiments.remove(child.query)
+        _untried_experiments = list(map(get_experiment_from_query, list(cur_untried_experiments)))
+        node.tried_experiments = _tried_experiments
+        node.untried_experiments = _untried_experiments
 
-        nodes_by_level[level].append(node)
-        node_map[(level, node_idx)] = node
+    if replay_mcts:
+        # Replay MCTS to assign correct visits and values in order of creation_idx
+        _nodes = sorted(node_map.values(), key=lambda x: x.creation_idx)
+        # Reset visits and value
+        for _node in _nodes:
+            _node.visits = 0
+            _node.value = 0
+        # Backpropagate visits and values
+        for _node in _nodes:
+            _node.update_counts(visits=1, reward=_node.self_value)
 
-    # Second pass - link parents and children
-    for data in node_data:
-        level = data['level']
-        node_idx = data['node_idx']
-        parent_idx = data['parent_idx']
-
-        node = node_map[(level, node_idx)]
-        if parent_idx is not None:
-            parent = node_map[(level - 1, parent_idx)]
-            node.parent = parent
-            parent.children.append(node)
-
-    root = nodes_by_level[0][0] if nodes_by_level[0] else None
     return root, nodes_by_level
 
 
-def save_nodes(nodes_dict_or_list, log_dirname, run_dedupe=True, model="gpt-4o", save_csv=True):
+def save_nodes(nodes_dict_or_list, log_dirname, run_dedupe=True, model="gpt-4o", save_csv=True,
+               time_elapsed=None):
+    """Save MCTS nodes to JSON and optionally to CSV.
+
+    Args:
+        nodes_dict_or_list: Dictionary or list of MCTSNode objects or dicts.
+        log_dirname: Directory to save the JSON and CSV files.
+        run_dedupe: Whether to deduplicate nodes based on hypothesis.
+        model: Model to use for deduplication.
+        save_csv: Whether to save nodes to a CSV file.
+        time_elapsed: Optional time elapsed for logging purposes.
+    """
+    from src.mcts import MCTSNode  # Import here to avoid circular import issues
+
     if type(nodes_dict_or_list) in [dict, defaultdict]:
         nodes_list = []
         for level, nodes in nodes_dict_or_list.items():
@@ -91,21 +113,31 @@ def save_nodes(nodes_dict_or_list, log_dirname, run_dedupe=True, model="gpt-4o",
                 nodes_list.append(node.to_dict())
     else:
         nodes_list = nodes_dict_or_list
+        if type(nodes_list[0]) is MCTSNode:
+            # Convert MCTSNode objects to dicts
+            nodes_list = [node.to_dict() for node in nodes_list]
 
     # Save nodes to JSON
-    nodes_list = save_nodes_to_json(nodes_list, log_dirname, run_dedupe=run_dedupe, dedupe_model=model)
+    nodes_list = save_nodes_to_json(nodes_list, log_dirname, run_dedupe=run_dedupe, dedupe_model=model,
+                                    time_elapsed=time_elapsed)
+
     # Save nodes to CSV
     if save_csv:
         csv_output_file = os.path.join(log_dirname, "mcts_nodes.csv")
         nodes_to_csv(nodes_list, csv_output_file)
 
 
-def save_nodes_to_json(nodes_list, log_dirname, run_dedupe=True, dedupe_model="gpt-4o", log_dedupe_comparisons=False):
+def save_nodes_to_json(nodes_list, log_dirname, run_dedupe=True, dedupe_model="gpt-4o", log_dedupe_comparisons=False,
+                       time_elapsed=None):
     """Save all MCTS nodes to a JSON file.
 
     Args:
         nodes_list: List of MCTS node objects.
         log_dirname: Directory to save the JSON file
+        run_dedupe: Whether to deduplicate nodes based on hypothesis.
+        dedupe_model: Model to use for deduplication.
+        log_dedupe_comparisons: Whether to log deduplication comparisons to a file.
+        time_elapsed: Optional time elapsed for logging purposes.
     """
     # Optionally deduplicate nodes based on hypothesis
     if run_dedupe:
@@ -125,6 +157,8 @@ def save_nodes_to_json(nodes_list, log_dirname, run_dedupe=True, dedupe_model="g
     with open(original_nodes_file, "w") as f:
         json.dump(nodes_list, f, indent=2)
     print(f"[JSON] Original MCTS nodes (n={len(nodes_list)}) saved to {original_nodes_file}.\n")
+    if time_elapsed is not None:
+        print(f"[Exploration] Time elapsed: {time_elapsed:.2f} seconds.\n")
     return file_to_save
 
 
@@ -168,11 +202,11 @@ def get_nodes(in_fpath_or_json: str | List[Dict[str, any]]) -> List[Dict[str, an
         # Load the MCTS nodes from the input file
         if os.path.isdir(in_fpath_or_json):
             mcts_nodes = []
-            for filename in os.listdir(in_fpath_or_json):
-                if filename.startswith('mcts_node_') and filename.endswith('.json'):
-                    with open(os.path.join(in_fpath_or_json, filename), 'r') as f:
-                        obj = json.load(f)
-                        mcts_nodes.append(obj)
+            filenames = glob(os.path.join(in_fpath_or_json, 'mcts_node_*.json'))
+            for filename in filenames:
+                with open(filename, 'r') as f:
+                    obj = json.load(f)
+                    mcts_nodes.append(obj)
         else:
             with open(in_fpath_or_json, 'r') as f:
                 mcts_nodes = json.load(f)
@@ -193,3 +227,71 @@ Belief Change: {node.belief_change}
 Surprisal: {node.surprising}
 
 ================================================================================\n\n""")
+
+
+def get_query_from_experiment(exp):
+    hypothesis = exp['hypothesis']
+    exp_plan = exp['experiment_plan']
+    new_query = ""
+    if hypothesis is not None:
+        new_query += f"Hypothesis: {hypothesis}\n\n"
+    new_query += f"""\
+Experiment objective: {exp_plan['objective']}
+
+Steps for the programmer:
+{exp_plan['steps']}
+
+Deliverables:
+{exp_plan['deliverables']}"""
+    return new_query
+
+
+def get_experiment_from_query(query):
+    # Extract the hypothesis and experiment plan from the query
+    hypothesis_match = re.search(r'Hypothesis:\s*(.*)', query)
+    hypothesis = hypothesis_match.group(1).strip() if hypothesis_match else None
+
+    exp_plan_match = re.search(r'Experiment objective:\s*(.*?)(?=\n\n|$)', query, re.DOTALL)
+    exp_plan = exp_plan_match.group(1).strip() if exp_plan_match else None
+
+    steps_match = re.search(r'Steps for the programmer:\s*(.*?)(?=\n\n|$)', query, re.DOTALL)
+    steps = steps_match.group(1).strip() if steps_match else None
+
+    deliverables_match = re.search(r'Deliverables:\s*(.*?)(?=\n\n|$)', query, re.DOTALL)
+    deliverables = deliverables_match.group(1).strip() if deliverables_match else None
+
+    return {
+        "hypothesis": hypothesis,
+        "experiment_plan": {
+            "objective": exp_plan,
+            "steps": steps,
+            "deliverables": deliverables
+        }
+    }
+
+
+def get_node_level_idx(node_or_id):
+    from src.mcts import MCTSNode
+
+    # Get the level and index of a node from its ID (e.g., "node_<level>_<idx>") or MCTSNode/dict.
+    if type(node_or_id) is MCTSNode:
+        id = node_or_id.id
+    elif type(node_or_id) is dict:
+        id = node_or_id["id"]
+    elif type(node_or_id) is str:
+        id = node_or_id
+
+    return map(int, id.split("_")[1:])
+
+
+def get_context_string(hyp_exp_query, code_output, analysis, review, include_code_output=True):
+    # Format the experiment to include as context in, e.g., an LLM call.
+    context_str = hyp_exp_query + "\n\n"
+    if include_code_output:
+        context_str += f"Code Output:\n{code_output}\n\n"
+    context_str += f"""\
+Analysis: {analysis}
+
+Review: {review}"""
+
+    return context_str
