@@ -244,7 +244,7 @@ LLM Decision: {'Merge' if llm_decision else 'Do not merge'}\n\n""")
     deduped_nodes = []
     for cluster_id, cluster in clusters.items():
         node_copy = copy.deepcopy(nodes_list[cluster_id])
-        node_copy['cluster'] = [f"{nodes_list[n]['level']}_{nodes_list[n]['node_idx']}" for n in cluster[1:]]
+        node_copy['cluster'] = [nodes_list[n]['id'] for n in cluster[1:]]
         node_copy['cluster_nodes'] = [copy.deepcopy(nodes_list[n]) for n in cluster if n != cluster_id]
         deduped_nodes.append(node_copy)
 
